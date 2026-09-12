@@ -17,8 +17,18 @@ pub enum AuthCommand {
     Device,
     /// Show the current authentication status
     Status,
+    /// Make another stored account active
+    Switch {
+        /// Account number from `auth status`, email, or account ID prefix;
+        /// defaults to the next account with quota left
+        account: Option<String>,
+    },
     /// Delete stored authentication credentials
-    Logout,
+    Logout {
+        /// Remove only this account: number from `auth status`, email, or
+        /// account ID prefix
+        account: Option<String>,
+    },
 }
 
 #[async_trait]
@@ -113,6 +123,17 @@ pub trait CliHandlers: Send + Sync {
     fn device(&self) -> Result<()>;
     fn status(&self) -> Result<()>;
     fn logout(&self) -> Result<()>;
+
+    /// Providers that store a single credential have no account to switch to.
+    fn switch(&self, account: Option<&str>) -> Result<()> {
+        let _ = account;
+        anyhow::bail!("This provider stores a single account")
+    }
+
+    fn logout_account(&self, account: &str) -> Result<()> {
+        let _ = account;
+        anyhow::bail!("This provider stores a single account")
+    }
 }
 
 #[derive(Debug, Clone)]

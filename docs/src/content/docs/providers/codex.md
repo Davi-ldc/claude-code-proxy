@@ -24,6 +24,19 @@ claude-code-proxy codex auth status
 
 The proxy owns its tokens and does not read native Codex CLI credentials. It refreshes expiring access tokens with a single-flight guard. See [Files and storage](/reference/files-and-storage/) for credential locations.
 
+### Multiple accounts
+
+Each `login` or `device` sign-in adds an account; signing in again as the same user renews that account's tokens. One account serves every request until upstream reports its usage limit. The proxy then records when the limit resets, makes the next account with quota active, and retries the request there at once. The retry resends the full conversation, because continuations, prompt caches and pooled sockets belong to the previous account. When no account has quota left, the request fails immediately with HTTP 429 and a `retry-after` for the reported reset.
+
+```sh
+claude-code-proxy codex auth status      # every account; * marks the active one
+claude-code-proxy codex auth switch      # next account with quota
+claude-code-proxy codex auth switch 2    # by number, email, or account ID prefix
+claude-code-proxy codex auth logout 2    # remove one account
+```
+
+Switching to an account by name clears its recorded limit; upstream reports the limit again if it still holds.
+
 ## Models and fast mode
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.

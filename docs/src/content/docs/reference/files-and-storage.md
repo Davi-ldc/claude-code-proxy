@@ -30,6 +30,8 @@ On macOS, Codex and Cursor use Keychain services:
 
 Kimi and Grok use `<configuration-root>/<provider>/auth.json` on every platform. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
 
+The Codex credential holds every signed-in account, the active one, and any reported usage-limit reset. A credential from a single-account release loads as one active account. Writers hold `auth.json.lock` beside the file, so a CLI sign-in and a token refresh in the running proxy cannot overwrite each other.
+
 When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
 `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.
 `CCP_CURSOR_AUTH_TOKEN` bypasses Cursor's local credential store for that

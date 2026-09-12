@@ -374,7 +374,9 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
             && is_standard_max_output_tokens_incomplete(&p);
         if !allowed_incomplete && let Some(failure) = classify_event_failure(&p) {
             let kind = match failure.kind {
-                CodexFailureKind::RateLimit => UpstreamErrorKind::RateLimit,
+                CodexFailureKind::RateLimit | CodexFailureKind::UsageLimit => {
+                    UpstreamErrorKind::RateLimit
+                }
                 CodexFailureKind::Overloaded => UpstreamErrorKind::Overloaded,
                 CodexFailureKind::Transient => UpstreamErrorKind::Transient,
                 CodexFailureKind::Permanent => UpstreamErrorKind::Failed,

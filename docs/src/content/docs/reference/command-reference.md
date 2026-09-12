@@ -56,7 +56,7 @@ claude-code-proxy <provider> auth <action>
 
 | Provider | `login` | `device` | `status` | `logout` |
 | --- | --- | --- | --- | --- |
-| `codex` | Browser PKCE | Device code | Account, expiry, storage | Delete proxy credential |
+| `codex` | Browser PKCE, adds an account | Device code, adds an account | Every account, active marker, expiry, usage limits, storage | Delete every account, or one with `logout <account>` |
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
@@ -69,6 +69,8 @@ claude-code-proxy grok auth device
 claude-code-proxy kimi auth status
 claude-code-proxy cursor auth logout
 ```
+
+`codex auth switch [account]` makes another stored Codex account active: the one named by its number in `auth status`, its email, or an account ID prefix, or else the next account with quota left. Other providers store a single account and reject `switch` and `logout <account>`.
 
 A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
 

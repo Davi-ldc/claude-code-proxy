@@ -1827,10 +1827,23 @@ async fn connect_via_http_upgrade(
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let limit_header = response
+            .headers()
+            .contains_key("x-codex-rate-limit-reached-type");
         let detail = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
             GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
         } else {
             let body = bounded_handshake_error_body(response).await;
+            if status == http::StatusCode::TOO_MANY_REQUESTS.as_u16()
+                && let Some(error) = super::client::usage_limit_error_from_body(
+                    &body,
+                    limit_header,
+                    retry_after.as_deref(),
+                    CodexErrorOrigin::WebSocketHandshake,
+                )
+            {
+                return Err(error);
+            }
             handshake_error_detail(Some(&body))
         };
         return Err(CodexError {

@@ -15,6 +15,20 @@ where
     fn save(&self, value: T) -> Result<()>;
     fn clear(&self) -> Result<()>;
     fn path(&self) -> String;
+
+    /// Hold across a load-modify-save sequence so another process writing
+    /// the same credentials, such as a CLI login while the server refreshes a
+    /// token, cannot interleave and lose either write. Stores without shared
+    /// durable state need no lock.
+    fn lock(&self) -> Result<AuthStoreLock> {
+        Ok(AuthStoreLock::default())
+    }
+}
+
+/// Advisory lock on a credential store, released on drop.
+#[derive(Default)]
+pub struct AuthStoreLock {
+    _file: Option<File>,
 }
 
 pub trait Keychain: Send + Sync {
@@ -194,6 +208,21 @@ where
     fn path(&self) -> String {
         self.file.clone()
     }
+
+    fn lock(&self) -> Result<AuthStoreLock> {
+        let lock_path = format!("{}.lock", self.file);
+        if let Some(dir) = std::path::Path::new(&lock_path).parent() {
+            fs::create_dir_all(dir)?;
+            set_mode(dir, 0o700);
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        file.lock()?;
+        Ok(AuthStoreLock { _file: Some(file) })
+    }
 }
 
 pub struct KeychainFileAuthStore<T, K = SystemKeychain>
@@ -282,6 +311,10 @@ where
         } else {
             self.file_store.path()
         }
+    }
+
+    fn lock(&self) -> Result<AuthStoreLock> {
+        self.file_store.lock()
     }
 }
 
@@ -621,5 +654,27 @@ mod tests {
         assert!(keychain.raw("svc", "acct").is_none());
         assert_eq!(store.path(), file);
         assert_eq!(store.load().unwrap().unwrap()["source"], json!("file"));
+    }
+
+    #[test]
+    fn file_store_lock_excludes_other_holders_until_dropped() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store: FileAuthStore<serde_json::Value> = FileAuthStore::new(
+            temp_auth_path(&temp, "auth.json"),
+            temp_auth_path(&temp, "legacy.json"),
+        );
+
+        let held = store.lock().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path().join("auth.json.lock"))
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(held);
+        assert!(contender.try_lock().is_ok());
     }
 }

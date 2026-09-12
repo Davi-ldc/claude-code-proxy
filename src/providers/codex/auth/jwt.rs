@@ -6,12 +6,14 @@ struct IdTokenClaims {
     chatgpt_account_id: Option<String>,
     #[serde(default)]
     organizations: Option<Vec<OrgClaim>>,
-    #[allow(dead_code)]
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
     #[serde(rename = "https://api.openai.com/auth")]
     openai_auth: Option<OpenAiAuthClaim>,
+    #[serde(default)]
+    #[serde(rename = "https://api.openai.com/profile")]
+    openai_profile: Option<OpenAiProfileClaim>,
     #[serde(default)]
     #[serde(rename = "https://api.openai.com/auth.chatgpt_account_id")]
     openai_chatgpt_account_id: Option<String>,
@@ -26,6 +28,28 @@ struct OrgClaim {
 struct OpenAiAuthClaim {
     #[serde(default)]
     chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_user_id: Option<String>,
+    #[serde(default)]
+    chatgpt_user_id: Option<String>,
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiProfileClaim {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Who a ChatGPT token belongs to, as far as its claims say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenIdentity {
+    /// One login: a user inside a ChatGPT workspace. Members of a workspace
+    /// share its account ID but each has their own usage limits.
+    pub account_user_id: Option<String>,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,9 +111,80 @@ pub fn extract_account_id(tokens: &TokenResponse) -> Option<String> {
     extract_account_id_from_claims(&claims)
 }
 
+pub fn token_identity(token: &str) -> TokenIdentity {
+    let Some(claims) = parse_jwt_claims(token) else {
+        return TokenIdentity::default();
+    };
+    let auth = claims.openai_auth.as_ref();
+    let account_user_id = auth
+        .and_then(|auth| auth.chatgpt_account_user_id.clone())
+        .or_else(|| {
+            let user_id = auth?.chatgpt_user_id.clone()?;
+            Some(match extract_account_id_from_claims(&claims) {
+                Some(account_id) => format!("{user_id}__{account_id}"),
+                None => user_id,
+            })
+        });
+    TokenIdentity {
+        account_user_id,
+        email: claims
+            .openai_profile
+            .as_ref()
+            .and_then(|profile| profile.email.clone())
+            .or_else(|| claims.email.clone()),
+        plan_type: auth.and_then(|auth| auth.chatgpt_plan_type.clone()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_token(claims: serde_json::Value) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+    format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_identity_reads_nested_openai_claims() {
+        let token = test_token(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_1",
+                "chatgpt_account_user_id": "user-1__acct_1",
+                "chatgpt_plan_type": "pro"
+            },
+            "https://api.openai.com/profile": { "email": "one@example.com" }
+        }));
+        assert_eq!(
+            token_identity(&token),
+            TokenIdentity {
+                account_user_id: Some("user-1__acct_1".into()),
+                email: Some("one@example.com".into()),
+                plan_type: Some("pro".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn token_identity_joins_user_and_account_when_combined_claim_is_missing() {
+        let token = test_token(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_1",
+                "chatgpt_user_id": "user-1"
+            }
+        }));
+        assert_eq!(
+            token_identity(&token).account_user_id.as_deref(),
+            Some("user-1__acct_1")
+        );
+    }
+
+    #[test]
+    fn token_identity_is_empty_for_opaque_tokens() {
+        assert_eq!(token_identity("opaque"), TokenIdentity::default());
+    }
 
     #[test]
     fn extract_account_id_from_access_token() {

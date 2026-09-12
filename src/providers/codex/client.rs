@@ -19,13 +19,53 @@ use super::translate::request::ResponsesRequest;
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+/// `CodexError::detail` for an exhausted account usage limit. `retry_after`
+/// then holds the seconds until the limit resets, when upstream reports it.
+pub const USAGE_LIMIT_DETAIL: &str = "usage_limit_reached";
+
+#[derive(Debug, Clone)]
 pub struct CodexError {
     pub status: u16,
     pub message: String,
     pub detail: Option<String>,
     pub retry_after: Option<String>,
     pub origin: CodexErrorOrigin,
+}
+
+impl CodexError {
+    pub fn usage_limit(
+        message: String,
+        retry_after: Option<String>,
+        origin: CodexErrorOrigin,
+    ) -> Self {
+        Self {
+            status: 429,
+            message,
+            detail: Some(USAGE_LIMIT_DETAIL.to_string()),
+            retry_after,
+            origin,
+        }
+    }
+
+    pub fn is_usage_limit(&self) -> bool {
+        self.detail.as_deref() == Some(USAGE_LIMIT_DETAIL)
+    }
+
+    /// When the reported usage limit resets, in Unix milliseconds.
+    pub fn usage_limit_resets_at_ms(&self) -> Option<u64> {
+        let seconds = self
+            .retry_after
+            .as_deref()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        Some(now + (seconds * 1000.0) as u64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,6 +807,43 @@ impl CodexHttpClient {
         &self.auth_manager
     }
 
+    /// Moves off the account whose usage limit `error` reports. Returns the
+    /// credential to retry with, or `None` when no other account has quota
+    /// left and `error` should reach the client unchanged.
+    async fn rotate_after_usage_limit(
+        &self,
+        auth: &StoredAuth,
+        error: &CodexError,
+        ctx: &RequestContext,
+    ) -> Option<StoredAuth> {
+        let log = create_logger("codex");
+        let mut fields = serde_json::Map::new();
+        fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
+        fields.insert("retryAfter".into(), serde_json::json!(error.retry_after));
+        match self
+            .auth_manager
+            .rotate_after_usage_limit(auth, error.usage_limit_resets_at_ms())
+            .await
+        {
+            Ok(Some(next)) => {
+                log.info("codex_account_rotated", Some(fields));
+                Some(next)
+            }
+            Ok(None) => {
+                log.warn("codex_accounts_usage_limited", Some(fields));
+                None
+            }
+            Err(rotation_error) => {
+                fields.insert(
+                    "error".into(),
+                    serde_json::json!(rotation_error.to_string()),
+                );
+                log.warn("codex_account_rotation_failed", Some(fields));
+                None
+            }
+        }
+    }
+
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
     }
@@ -799,7 +876,7 @@ impl CodexHttpClient {
                 drop(response);
                 auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -898,7 +975,7 @@ impl CodexHttpClient {
                 drop(response);
                 auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -984,7 +1061,7 @@ impl CodexHttpClient {
                 drop(response);
                 auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -1087,9 +1164,17 @@ impl CodexHttpClient {
                 auth_refresh_attempted = true;
                 auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
+                continue;
+            }
+            if let Some(error) = usage_limit_status_error(&response) {
+                let Some(next) = self.rotate_after_usage_limit(&auth, &error, ctx).await else {
+                    return Err(error);
+                };
+                auth = next;
+                auth_refresh_attempted = false;
                 continue;
             }
             if should_retry_codex_status(response.status)
@@ -1211,7 +1296,7 @@ impl CodexHttpClient {
                 *auth_refresh_attempted = true;
                 *auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh(auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -1221,6 +1306,13 @@ impl CodexHttpClient {
                 let response = self.collect_http_response(resp, started_at, ctx).await?;
                 let mut error = codex_status_error(response);
                 error.origin = CodexErrorOrigin::Http;
+                if error.is_usage_limit()
+                    && let Some(next) = self.rotate_after_usage_limit(auth, &error, ctx).await
+                {
+                    *auth = next;
+                    *auth_refresh_attempted = false;
+                    continue;
+                }
                 return Err(error);
             }
 
@@ -1466,7 +1558,7 @@ impl CodexHttpClient {
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
                             && let Some(failure) = failure.as_ref()
-                            && failure.retryable()
+                            && (failure.retryable() || failure.is_usage_limit())
                         {
                             pending_events.clear();
                             break 'read_attempt codex_event_failure_error(failure.clone());
@@ -1538,19 +1630,33 @@ impl CodexHttpClient {
                 };
 
                 loop {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let _ = tx.send(Err(retry_error)).await;
-                        return;
-                    }
-                    let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
-                    if delay.exceeds_budget {
-                        let _ = tx.send(Err(retry_error)).await;
-                        return;
-                    }
-                    retries += 1;
-                    tokio::select! {
-                        _ = tx.closed() => return,
-                        _ = sleep(delay.wait_ms) => {}
+                    if retry_error.is_usage_limit() {
+                        let rotation = tokio::select! {
+                            _ = tx.closed() => return,
+                            next = client.rotate_after_usage_limit(&auth, &retry_error, &ctx) => next,
+                        };
+                        let Some(next) = rotation else {
+                            let _ = tx.send(Err(retry_error)).await;
+                            return;
+                        };
+                        auth = next;
+                        auth_refresh_attempted = false;
+                    } else {
+                        if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                            let _ = tx.send(Err(retry_error)).await;
+                            return;
+                        }
+                        let delay =
+                            compute_backoff_delay(retries, retry_error.retry_after.as_deref());
+                        if delay.exceeds_budget {
+                            let _ = tx.send(Err(retry_error)).await;
+                            return;
+                        }
+                        retries += 1;
+                        tokio::select! {
+                            _ = tx.closed() => return,
+                            _ = sleep(delay.wait_ms) => {}
+                        }
                     }
 
                     let next_attempt = tokio::select! {
@@ -1719,7 +1825,7 @@ impl CodexHttpClient {
 
             if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
+                match self.auth_manager.force_refresh(&auth).await {
                     Ok(new_auth) => {
                         auth = new_auth;
                         invalidate_live_continuation_pool(active_continuation.as_ref());
@@ -1737,6 +1843,17 @@ impl CodexHttpClient {
                         });
                     }
                 }
+            }
+
+            if let Some(error) = buffered_usage_limit_error(&result) {
+                let Some(next) = self.rotate_after_usage_limit(&auth, &error, ctx).await else {
+                    return Err(error);
+                };
+                auth = next;
+                auth_refresh_attempted = false;
+                invalidate_live_continuation_pool(active_continuation.as_ref());
+                active_continuation = full_context_continuation(active_continuation.as_ref());
+                continue;
             }
 
             if let Ok(response) = &result
@@ -2058,7 +2175,7 @@ impl CodexHttpClient {
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
                         invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
+                        let refresh = self.auth_manager.force_refresh(&auth);
                         auth = match refresh.await {
                             Ok(auth) => {
                                 if tx.is_closed() {
@@ -2080,6 +2197,33 @@ impl CodexHttpClient {
                                 return;
                             }
                         };
+                        if continuation_retry_available {
+                            socket_id_publisher.mark_full_context_retry();
+                        }
+                        continuation = full_context_continuation(continuation.as_ref());
+                        continuation_retry_available = false;
+                        continue 'attempt;
+                    }
+                    Err(err) if err.is_usage_limit() && !forwarded_any => {
+                        let Some(next) = self.rotate_after_usage_limit(&auth, &err, &ctx).await else {
+                            if tx.send(Err(err)).await.is_err() {
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
+                            }
+                            return;
+                        };
+                        if tx.is_closed() {
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                            return;
+                        }
+                        auth = next;
+                        auth_refresh_attempted = false;
+                        invalidate_live_continuation_pool(continuation.as_ref());
                         if continuation_retry_available {
                             socket_id_publisher.mark_full_context_retry();
                         }
@@ -2146,7 +2290,7 @@ impl CodexHttpClient {
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     invalidate_live_continuation_pool(continuation.as_ref());
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
+                    let refresh = self.auth_manager.force_refresh(&auth);
                     auth = match refresh.await {
                         Ok(auth) => {
                             if tx.is_closed() {
@@ -2180,6 +2324,28 @@ impl CodexHttpClient {
                             return;
                         }
                     };
+                    if continuation_retry_available {
+                        socket_id_publisher.mark_full_context_retry();
+                    }
+                    continuation = full_context_continuation(continuation.as_ref());
+                    continuation_retry_available = false;
+                    continue 'attempt;
+                }
+
+                if !forwarded_any
+                    && let Some(error) = live_usage_limit_error(&item)
+                    && let Some(next) = self.rotate_after_usage_limit(&auth, &error, &ctx).await
+                {
+                    invalidate_live_continuation_pool(continuation.as_ref());
+                    if tx.is_closed() {
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
+                        return;
+                    }
+                    auth = next;
+                    auth_refresh_attempted = false;
                     if continuation_retry_available {
                         socket_id_publisher.mark_full_context_retry();
                     }
@@ -2535,6 +2701,13 @@ fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
 }
 
 fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> CodexError {
+    if failure.is_usage_limit() {
+        return CodexError::usage_limit(
+            failure.message,
+            failure.retry_after,
+            CodexErrorOrigin::Http,
+        );
+    }
     CodexError {
         status: failure.status,
         message: failure.message.clone(),
@@ -2544,7 +2717,46 @@ fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> Codex
     }
 }
 
+/// The usage-limit error in a buffered attempt's outcome: a rejected
+/// handshake, a 429 status, or a failure event inside a 2xx body.
+fn buffered_usage_limit_error(
+    result: &Result<OwnerAwareCodexResponse, CodexError>,
+) -> Option<CodexError> {
+    match result {
+        Err(err) => err.is_usage_limit().then(|| err.clone()),
+        Ok(response) if (200..300).contains(&response.status) => {
+            let failure = super::events::first_event_failure(&response.body)
+                .filter(super::events::CodexEventFailure::is_usage_limit)?;
+            let mut error = codex_event_failure_error(failure);
+            error.origin = match response.transport {
+                ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+            };
+            Some(error)
+        }
+        Ok(response) => usage_limit_status_error(response),
+    }
+}
+
+/// The usage-limit error a live WebSocket item carries, as a transport error
+/// or as a failure event.
+fn live_usage_limit_error(item: &Result<serde_json::Value, CodexError>) -> Option<CodexError> {
+    match item {
+        Err(err) => err.is_usage_limit().then(|| err.clone()),
+        Ok(payload) => super::events::classify_event_failure(payload)
+            .filter(super::events::CodexEventFailure::is_usage_limit)
+            .map(|failure| {
+                let mut error = codex_event_failure_error(failure);
+                error.origin = CodexErrorOrigin::WebSocket;
+                error
+            }),
+    }
+}
+
 fn retryable_http_stream_error(error: &CodexError) -> bool {
+    if error.is_usage_limit() {
+        return false;
+    }
     if should_retry_codex_status(error.status) || is_retryable_transport_error(error) {
         return true;
     }
@@ -2758,7 +2970,58 @@ fn auth_refresh_error(err: anyhow::Error) -> CodexError {
     }
 }
 
+fn usage_limit_status_error(response: &CodexResponse) -> Option<CodexError> {
+    if response.status != 429 {
+        return None;
+    }
+    let header = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let origin = match response.transport {
+        ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+        ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+    };
+    usage_limit_error_from_body(
+        &response.body,
+        header("x-codex-rate-limit-reached-type").is_some(),
+        header("retry-after"),
+        origin,
+    )
+}
+
+/// Codex rejects a request from an exhausted account with 429 and either a
+/// body naming the limit or the `x-codex-rate-limit-reached-type` header.
+/// Returns the usage-limit error for such a rejection, `None` for throttling.
+pub(crate) fn usage_limit_error_from_body(
+    body: &[u8],
+    limit_header: bool,
+    retry_after_header: Option<&str>,
+    origin: CodexErrorOrigin,
+) -> Option<CodexError> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let error = value.as_ref().and_then(super::events::event_error);
+    if !limit_header && !error.is_some_and(super::events::is_usage_limit_error) {
+        return None;
+    }
+    let retry_after = error
+        .and_then(super::events::usage_limit_retry_after)
+        .or_else(|| retry_after_header.map(str::to_string));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .unwrap_or("The usage limit has been reached")
+        .to_string();
+    Some(CodexError::usage_limit(message, retry_after, origin))
+}
+
 fn codex_status_error(response: CodexResponse) -> CodexError {
+    if let Some(error) = usage_limit_status_error(&response) {
+        return error;
+    }
     let retry_after = response
         .headers
         .iter()
@@ -2862,6 +3125,9 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    if err.is_usage_limit() {
+        return false;
+    }
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -2921,7 +3187,8 @@ fn should_refresh_after_unauthorized(
 }
 
 fn should_fallback_to_http(err: &CodexError) -> bool {
-    err.origin == CodexErrorOrigin::WebSocketHandshake
+    !err.is_usage_limit()
+        && err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
 }
@@ -3530,6 +3797,101 @@ mod tests {
             MAX_BUFFERED_TRANSPORT_ATTEMPTS,
             "initial status failures must share the HTTP stream retry budget"
         );
+    }
+
+    fn two_account_pool() -> super::super::auth::token_store::CodexAccountPool {
+        let mut pool = super::super::auth::token_store::CodexAccountPool::default();
+        for (access, account_id) in [("first", "acct_1"), ("second", "acct_2")] {
+            pool.upsert(StoredAuth {
+                access: access.into(),
+                refresh: String::new(),
+                account_id: Some(account_id.into()),
+                expires: u64::MAX,
+            });
+        }
+        pool
+    }
+
+    /// Answers every request with a usage-limit rejection and returns the
+    /// bearer tokens in arrival order.
+    fn usage_limited_server(listener: TcpListener) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut tokens = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                tokens.push(
+                    request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("authorization: Bearer "))
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let body = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}"#;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+            tokens
+        })
+    }
+
+    #[tokio::test]
+    async fn http_stream_moves_to_the_next_account_on_usage_limit_then_fails_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = usage_limited_server(listener);
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_pool(two_account_pool());
+        let error = match client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+        {
+            Ok(_) => panic!("every account is usage limited"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_usage_limit());
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after.as_deref(), Some("3600"));
+        assert_eq!(server.await.unwrap(), ["first", "second"]);
+        let pool = client.auth_manager().test_pool().unwrap();
+        assert!(
+            pool.accounts
+                .iter()
+                .all(|account| account.limited_until.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_http_moves_to_the_next_account_on_usage_limit_then_fails_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = usage_limited_server(listener);
+
+        let client = http_test_client(format!("http://{addr}/responses"), 1_000);
+        client.auth_manager().set_test_pool(two_account_pool());
+        let error = match client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Ok(_) => panic!("every account is usage limited"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_usage_limit());
+        assert_eq!(server.await.unwrap(), ["first", "second"]);
     }
 
     #[tokio::test]

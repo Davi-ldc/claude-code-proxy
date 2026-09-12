@@ -3,6 +3,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
     RateLimit,
+    /// The account's usage limit is exhausted until a reset hours away.
+    /// Backing off cannot help; another account can serve the request.
+    UsageLimit,
     Overloaded,
     Transient,
     Permanent,
@@ -28,7 +31,14 @@ pub(crate) struct CodexEventFailure {
 
 impl CodexEventFailure {
     pub fn retryable(&self) -> bool {
-        !matches!(self.kind, CodexFailureKind::Permanent)
+        !matches!(
+            self.kind,
+            CodexFailureKind::Permanent | CodexFailureKind::UsageLimit
+        )
+    }
+
+    pub fn is_usage_limit(&self) -> bool {
+        self.kind == CodexFailureKind::UsageLimit
     }
 
     pub fn client_status(&self) -> u16 {
@@ -106,6 +116,38 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
                 .pointer("/response/error")
                 .filter(|error| !error.is_null())
         })
+}
+
+/// Whether an upstream error object reports an exhausted account rather than
+/// short-term throttling. Codex names the limit in `type`, or in `code` for
+/// API quota, and states it in the message.
+pub(crate) fn is_usage_limit_error(error: &Value) -> bool {
+    let names_limit = |field: &str| {
+        matches!(
+            error.get(field).and_then(Value::as_str),
+            Some("usage_limit_reached" | "insufficient_quota")
+        )
+    };
+    names_limit("type")
+        || names_limit("code")
+        || error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("usage limit"))
+}
+
+/// Seconds until an exhausted usage limit resets, from `resets_in_seconds` or
+/// the absolute `resets_at` in Unix seconds.
+pub(crate) fn usage_limit_retry_after(error: &Value) -> Option<String> {
+    if let Some(seconds) = error.get("resets_in_seconds").and_then(Value::as_u64) {
+        return Some(seconds.to_string());
+    }
+    let resets_at = error.get("resets_at").and_then(Value::as_u64)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(resets_at.saturating_sub(now).to_string())
 }
 
 pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
@@ -188,19 +230,22 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     let context_window = code == Some("context_length_exceeded")
         || lower.contains("context window")
         || lower.contains("context length exceeded");
+    let usage_limit = error.is_some_and(is_usage_limit_error);
 
-    let kind = if context_window
+    let kind = if usage_limit {
+        CodexFailureKind::UsageLimit
+    } else if context_window
         || matches!(
             code,
             Some(
                 "context_length_exceeded"
-                    | "insufficient_quota"
                     | "usage_not_included"
                     | "cyber_policy"
                     | "invalid_prompt"
                     | "bio_policy"
             )
-        ) {
+        )
+    {
         CodexFailureKind::Permanent
     } else if matches!(code, Some("server_is_overloaded" | "slow_down")) {
         CodexFailureKind::Overloaded
@@ -239,7 +284,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             Some("insufficient_quota") => 429,
             Some("usage_not_included") => 403,
             _ => match kind {
-                CodexFailureKind::RateLimit => 429,
+                CodexFailureKind::RateLimit | CodexFailureKind::UsageLimit => 429,
                 CodexFailureKind::Overloaded => 529,
                 CodexFailureKind::Transient => 503,
                 CodexFailureKind::Permanent => 500,
@@ -256,7 +301,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         })
         .or_else(|| scalar_string(payload.get("retry_after_seconds")))
         .or_else(|| scalar_string(payload.pointer("/headers/retry-after")))
-        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")));
+        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")))
+        .or_else(|| {
+            error
+                .filter(|_| usage_limit)
+                .and_then(usage_limit_retry_after)
+        });
 
     Some(CodexEventFailure {
         kind,
@@ -335,6 +385,53 @@ fn retryable_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_usage_limit_as_non_retryable_with_its_reset() {
+        let failure = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "plus",
+                "resets_in_seconds": 3600
+            }
+        }))
+        .unwrap();
+        assert!(failure.is_usage_limit());
+        assert!(!failure.retryable());
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.retry_after.as_deref(), Some("3600"));
+    }
+
+    #[test]
+    fn usage_limit_reset_derives_from_absolute_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let error = serde_json::json!({ "type": "usage_limit_reached", "resets_at": now + 120 });
+        let seconds: u64 = usage_limit_retry_after(&error).unwrap().parse().unwrap();
+        assert!((119..=120).contains(&seconds));
+    }
+
+    #[test]
+    fn throttling_is_not_a_usage_limit() {
+        assert!(!is_usage_limit_error(&serde_json::json!({
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit reached for requests"
+        })));
+        let failure = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "error": { "code": "rate_limit_exceeded", "message": "Rate limit reached" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(failure.kind, CodexFailureKind::RateLimit);
+        assert!(failure.retryable());
+    }
 
     #[test]
     fn classifies_retryable_failure_kinds() {

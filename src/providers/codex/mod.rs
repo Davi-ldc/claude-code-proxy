@@ -36,7 +36,7 @@ use crate::retry::{compute_backoff_delay, sleep};
 use self::auth::browser_login::run_browser_login;
 use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
-use self::auth::token_store::file_store;
+use self::auth::token_store::{CodexAccountPool, StoredAuth, file_store};
 use self::client::CodexHttpClient;
 use self::compaction::{
     CompactionAttempt, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
@@ -1286,6 +1286,9 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.is_usage_limit() {
+        return false;
+    }
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -1343,6 +1346,13 @@ fn codex_event_failure_error(
     failure: &events::CodexEventFailure,
     origin: client::CodexErrorOrigin,
 ) -> client::CodexError {
+    if failure.is_usage_limit() {
+        return client::CodexError::usage_limit(
+            failure.message.clone(),
+            failure.retry_after.clone(),
+            origin,
+        );
+    }
     client::CodexError {
         status: failure.status,
         message: failure.message.clone(),
@@ -1484,7 +1494,7 @@ fn is_context_window_overflow(message: &str) -> bool {
 }
 
 fn codex_error_message(err: &client::CodexError) -> &str {
-    if err.status == 0 {
+    if err.status == 0 || err.is_usage_limit() {
         err.message.as_str()
     } else {
         err.detail.as_deref().unwrap_or("Upstream error")
@@ -1499,54 +1509,57 @@ pub(crate) struct CodexCli;
 
 impl CliHandlers for CodexCli {
     fn login(&self) -> Result<(), anyhow::Error> {
-        let tokens = run_browser_login()?;
-        let store = file_store();
-        let manager = CodexAuthManager::new(store);
-        let saved = manager.persist_initial_tokens(&tokens)?;
-        print!(
-            "{}",
-            format_auth_saved_output(&manager.store.auth_path(), saved.account_id.as_deref())
-        );
-        Ok(())
+        save_login(&run_browser_login()?)
     }
 
     fn device(&self) -> Result<(), anyhow::Error> {
-        let tokens = DeviceAuthClient::new().run()?;
-        let store = file_store();
-        let manager = CodexAuthManager::new(store);
-        let saved = manager.persist_initial_tokens(&tokens)?;
-        print!(
-            "{}",
-            format_auth_saved_output(&manager.store.auth_path(), saved.account_id.as_deref())
-        );
-        Ok(())
+        save_login(&DeviceAuthClient::new().run()?)
     }
 
     fn status(&self) -> Result<(), anyhow::Error> {
-        let store = file_store();
-        let stored = store.load_auth()?;
-        match stored {
-            Some(auth) => {
-                println!(
-                    "Account: {}",
-                    auth.account_id.as_deref().unwrap_or("(none)")
-                );
-                println!("{}", format_expiry(auth.expires, now_ms()));
-                println!("Storage: {}", store.auth_path());
-                Ok(())
-            }
-            None => {
-                anyhow::bail!("Not authenticated");
-            }
+        let manager = CodexAuthManager::new(file_store());
+        let pool = manager.accounts()?;
+        if pool.accounts.is_empty() {
+            anyhow::bail!("Not authenticated");
         }
+        print!("{}", format_account_pool(&pool, now_ms()));
+        println!("Storage: {}", manager.storage_path());
+        Ok(())
+    }
+
+    fn switch(&self, account: Option<&str>) -> Result<(), anyhow::Error> {
+        let manager = CodexAuthManager::new(file_store());
+        let active = manager.switch(account)?;
+        let position = manager
+            .accounts()?
+            .index_of(&active.key())
+            .map_or(0, |index| index + 1);
+        println!("Active: {position}  {}", account_label(&active.auth));
+        Ok(())
     }
 
     fn logout(&self) -> Result<(), anyhow::Error> {
-        let store = file_store();
-        store.clear_auth()?;
+        CodexAuthManager::new(file_store()).clear()?;
         println!("Logged out");
         Ok(())
     }
+
+    fn logout_account(&self, account: &str) -> Result<(), anyhow::Error> {
+        let removed = CodexAuthManager::new(file_store()).remove(account)?;
+        println!("Removed: {}", account_label(&removed.auth));
+        Ok(())
+    }
+}
+
+fn save_login(tokens: &auth::jwt::TokenResponse) -> Result<(), anyhow::Error> {
+    let manager = CodexAuthManager::new(file_store());
+    let saved = manager.persist_initial_tokens(tokens)?;
+    let account_count = manager.accounts()?.accounts.len();
+    print!(
+        "{}",
+        format_auth_saved_output(&manager.storage_path(), &saved, account_count)
+    );
+    Ok(())
 }
 
 pub(crate) static CODEX_CLI: CodexCli = CodexCli;
@@ -1562,9 +1575,9 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn format_expiry(expires: u64, now: u64) -> String {
-    let remaining = (i128::from(expires) - i128::from(now)).div_euclid(1000);
-    let iso = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires) * 1_000_000)
+fn format_timestamp(at: u64, now: u64) -> String {
+    let remaining = (i128::from(at) - i128::from(now)).div_euclid(1000);
+    let iso = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at) * 1_000_000)
         .ok()
         .and_then(|dt| {
             let fmt = time::format_description::parse_borrowed::<2>(
@@ -1574,15 +1587,58 @@ fn format_expiry(expires: u64, now: u64) -> String {
             dt.format(&fmt).ok()
         })
         .unwrap_or_else(|| "invalid".to_string());
-    format!("Expires: {iso} (in {remaining}s)")
+    format!("{iso} (in {remaining}s)")
 }
 
-fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String {
-    let mut out = format!("Auth saved in {auth_path}\n");
-    if let Some(account_id) = account_id {
-        out.push_str(&format!("Account: {account_id}\n"));
+fn format_expiry(expires: u64, now: u64) -> String {
+    format!("Expires: {}", format_timestamp(expires, now))
+}
+
+/// Account ID, then email and plan when the token names them.
+fn account_label(auth: &StoredAuth) -> String {
+    let identity = auth.identity();
+    [
+        Some(auth.account_id.clone().unwrap_or_else(|| "(none)".into())),
+        identity.email,
+        identity.plan_type,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  ")
+}
+
+/// One entry per account, `*` marking the active one, followed by its token
+/// expiry and any usage limit that has not reset yet.
+fn format_account_pool(pool: &CodexAccountPool, now: u64) -> String {
+    let active = pool.active_index();
+    let mut out = String::new();
+    for (index, account) in pool.accounts.iter().enumerate() {
+        let marker = if active == Some(index) { '*' } else { ' ' };
+        out.push_str(&format!(
+            "{marker} {}  {}\n",
+            index + 1,
+            account_label(&account.auth)
+        ));
+        out.push_str(&format!(
+            "     {}\n",
+            format_expiry(account.auth.expires, now)
+        ));
+        if let Some(until) = account.limited_until.filter(|&until| until > now) {
+            out.push_str(&format!(
+                "     Usage limit resets: {}\n",
+                format_timestamp(until, now)
+            ));
+        }
     }
     out
+}
+
+fn format_auth_saved_output(auth_path: &str, saved: &StoredAuth, account_count: usize) -> String {
+    format!(
+        "Auth saved in {auth_path}\nAccount: {}\nStored accounts: {account_count}\n",
+        account_label(saved)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,20 +2057,39 @@ mod tests {
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
     }
 
+    fn saved_login(account_id: Option<&str>) -> StoredAuth {
+        StoredAuth {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires: 0,
+            account_id: account_id.map(str::to_string),
+        }
+    }
+
     #[test]
     fn format_auth_saved_output_with_account() {
         assert_eq!(
-            format_auth_saved_output("/tmp/auth.json", Some("acct_1")),
-            "Auth saved in /tmp/auth.json\nAccount: acct_1\n"
+            format_auth_saved_output("/tmp/auth.json", &saved_login(Some("acct_1")), 2),
+            "Auth saved in /tmp/auth.json\nAccount: acct_1\nStored accounts: 2\n"
         );
     }
 
     #[test]
     fn format_auth_saved_output_without_account() {
         assert_eq!(
-            format_auth_saved_output("/tmp/auth.json", None),
-            "Auth saved in /tmp/auth.json\n"
+            format_auth_saved_output("/tmp/auth.json", &saved_login(None), 1),
+            "Auth saved in /tmp/auth.json\nAccount: (none)\nStored accounts: 1\n"
         );
+    }
+
+    #[test]
+    fn account_label_adds_email_and_plan_from_token_claims() {
+        let mut saved = saved_login(Some("acct_1"));
+        saved.access = auth::jwt::test_token(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_plan_type": "pro" },
+            "https://api.openai.com/profile": { "email": "one@example.com" }
+        }));
+        assert_eq!(account_label(&saved), "acct_1  one@example.com  pro");
     }
 
     #[test]

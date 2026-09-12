@@ -214,8 +214,22 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 }
                 Ok(())
             }
-            claude_code_proxy::provider::AuthCommand::Logout => {
-                handlers.logout()?;
+            claude_code_proxy::provider::AuthCommand::Switch { account } => {
+                if let Err(err) = handlers.switch(account.as_deref()) {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+                Ok(())
+            }
+            claude_code_proxy::provider::AuthCommand::Logout { account } => {
+                let result = match account.as_deref() {
+                    Some(account) => handlers.logout_account(account),
+                    None => handlers.logout(),
+                };
+                if let Err(err) = result {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
                 Ok(())
             }
         },
